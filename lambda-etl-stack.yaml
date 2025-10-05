@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Stack de Lambda ETL con buckets S3 para procesamiento de archivos CSV'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: diego-puentes
+    Description: Nombre base para recursos del proyecto
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Ambiente de deployment
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+    Description: Runtime de Python para Lambda
+
+Resources:
+  # Bucket S3 de origen (source)
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-bucket-${Environment}-2025'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Purpose
+          Value: Lambda-Source
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Bucket S3 de destino (target)
+  TargetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-target-bucket-${Environment}-2025'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Purpose
+          Value: Lambda-Target
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Función Lambda para ETL
+  ETLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-etl-function-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref TargetBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import os
+          from io import StringIO
+          from datetime import datetime
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              source_bucket = event['Records'][0]['s3']['bucket']['name']
+              source_key = event['Records'][0]['s3']['object']['key']
+              target_bucket = os.environ.get('TARGET_BUCKET')
+
+              print(f"Procesando: {source_key} desde {source_bucket}")
+
+              try:
+                  response = s3_client.get_object(Bucket=source_bucket, Key=source_key)
+                  csv_bytes = response['Body'].read()
+
+                  encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+                  csv_content = None
+
+                  for encoding in encodings:
+                      try:
+                          csv_content = csv_bytes.decode(encoding)
+                          print(f"Decodificado con: {encoding}")
+                          break
+                      except UnicodeDecodeError:
+                          continue
+
+                  if csv_content is None:
+                      raise Exception("No se pudo decodificar")
+
+                  csv_reader = csv.DictReader(StringIO(csv_content))
+                  processed_rows = []
+
+                  for row in csv_reader:
+                      row['processed_timestamp'] = datetime.now().isoformat()
+                      row['managed_by'] = 'CloudFormation'
+
+                      if 'price' in row:
+                          try:
+                              price_float = float(row['price'])
+                              row['price'] = str(price_float)
+                              row['price_with_tax'] = str(round(price_float * 1.19, 2))
+                          except:
+                              pass
+
+                      processed_rows.append(row)
+
+                  output = StringIO()
+                  if processed_rows:
+                      fieldnames = processed_rows[0].keys()
+                      writer = csv.DictWriter(output, fieldnames=fieldnames)
+                      writer.writeheader()
+                      writer.writerows(processed_rows)
+
+                  target_key = f"processed/{source_key.split('/')[-1]}"
+                  s3_client.put_object(
+                      Bucket=target_bucket,
+                      Key=target_key,
+                      Body=output.getvalue().encode('utf-8'),
+                      ContentType='text/csv'
+                  )
+
+                  print(f"Procesados {len(processed_rows)} registros")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'records': len(processed_rows)})
+                  }
+
+              except Exception as e:
+                  print(f"ERROR: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Permiso para que S3 invoque Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ETLFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt SourceBucket.Arn
+
+  # Configuración de notificación S3 (trigger)
+  # Nota: Esto se debe hacer manualmente después del deployment
+  # debido a limitaciones de CloudFormation con buckets existentes
+
+Outputs:
+  SourceBucketName:
+    Description: Nombre del bucket source
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  TargetBucketName:
+    Description: Nombre del bucket target
+    Value: !Ref TargetBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetBucket'
+
+  LambdaFunctionArn:
+    Description: ARN de la función Lambda
+    Value: !GetAtt ETLFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  LambdaFunctionName:
+    Description: Nombre de la función Lambda
+    Value: !Ref ETLFunction
